@@ -3,6 +3,80 @@ import api from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import { generateReceiptPDF } from '../../utils/receiptGenerator';
 import { Search, MapPin, Clock, ShoppingBag, Utensils, Star, CreditCard, ShieldCheck } from 'lucide-react';
+import { isValidCardNumber, isValidCardExpiry, isValidCvv } from '../../utils/validators';
+
+// Live Expiry & Pickup Countdown Timer Component
+const ExpiryTimer = ({ expiryDate, pickupEndTime }) => {
+  const [timeLeft, setTimeLeft] = useState('');
+  const [isUrgent, setIsUrgent] = useState(false);
+  const [isExpired, setIsExpired] = useState(false);
+
+  useEffect(() => {
+    const calculateTime = () => {
+      let target = expiryDate ? new Date(expiryDate).getTime() : null;
+      if (!target && pickupEndTime) {
+        const [hours, minutes] = pickupEndTime.split(':');
+        const d = new Date();
+        d.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0);
+        if (d.getTime() < Date.now()) d.setDate(d.getDate() + 1);
+        target = d.getTime();
+      }
+
+      if (!target) return;
+
+      const diff = target - Date.now();
+      if (diff <= 0) {
+        setIsExpired(true);
+        setTimeLeft('Expired');
+        return;
+      }
+
+      setIsExpired(false);
+      const hours = Math.floor(diff / (1000 * 60 * 60));
+      const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const secs = Math.floor((diff % (1000 * 60)) / 1000);
+
+      setIsUrgent(diff < 30 * 60 * 1000); // Less than 30 mins
+
+      const pad = (n) => String(n).padStart(2, '0');
+      if (hours > 0) {
+        setTimeLeft(`${pad(hours)}h ${pad(mins)}m ${pad(secs)}s`);
+      } else {
+        setTimeLeft(`${pad(mins)}m ${pad(secs)}s`);
+      }
+    };
+
+    calculateTime();
+    const interval = setInterval(calculateTime, 1000);
+
+    return () => clearInterval(interval);
+  }, [expiryDate, pickupEndTime]);
+
+  if (isExpired) {
+    return (
+      <span className="badge badge-danger" style={{ fontSize: '0.65rem', display: 'inline-flex', alignItems: 'center', gap: '0.2rem' }}>
+        🔴 Expired
+      </span>
+    );
+  }
+
+  return (
+    <span 
+      className={`badge ${isUrgent ? 'badge-danger' : 'badge-secondary'}`} 
+      style={{ 
+        fontSize: '0.65rem', 
+        display: 'inline-flex', 
+        alignItems: 'center', 
+        gap: '0.25rem',
+        background: isUrgent ? 'linear-gradient(135deg, #ef4444, #f59e0b)' : 'rgba(255,255,255,0.08)',
+        color: '#fff',
+        fontWeight: isUrgent ? 700 : 600
+      }}
+    >
+      <Clock size={10} /> {isUrgent ? '🔥 Ending Soon:' : '⏳ Ends In:'} {timeLeft}
+    </span>
+  );
+};
 
 const CustomerDashboard = () => {
   const { user } = useAuth();
@@ -15,6 +89,9 @@ const CustomerDashboard = () => {
   const [search, setSearch] = useState('');
   const [cuisine, setCuisine] = useState('');
   const [maxPrice, setMaxPrice] = useState('');
+  const [dietaryType, setDietaryType] = useState('all');
+  const [selectedAllergen, setSelectedAllergen] = useState('all');
+  const [isSurpriseBagOnly, setIsSurpriseBagOnly] = useState(false);
 
   // Modal Reservation states
   const [selectedItem, setSelectedItem] = useState(null);
@@ -38,6 +115,9 @@ const CustomerDashboard = () => {
       if (search) params.search = search;
       if (cuisine) params.cuisine = cuisine;
       if (maxPrice) params.maxPrice = maxPrice;
+      if (dietaryType && dietaryType !== 'all') params.dietaryType = dietaryType;
+      if (selectedAllergen && selectedAllergen !== 'all') params.allergen = selectedAllergen;
+      if (isSurpriseBagOnly) params.isSurpriseBag = true;
 
       const { data } = await api.get('/customer/listings', { params });
       setListings(data);
@@ -54,7 +134,7 @@ const CustomerDashboard = () => {
     }, 400);
 
     return () => clearTimeout(delayDebounce);
-  }, [search, cuisine, maxPrice]);
+  }, [search, cuisine, maxPrice, dietaryType, selectedAllergen, isSurpriseBagOnly]);
 
   const handleOpenReserve = (item) => {
     setSelectedItem(item);
@@ -71,13 +151,53 @@ const CustomerDashboard = () => {
 
   const handleProceedToPayment = (e) => {
     e.preventDefault();
+    setErrorMsg('');
+
+    const qty = parseInt(reserveQty, 10);
+    if (isNaN(qty) || qty < 1) {
+      setErrorMsg('Please select at least 1 item to reserve');
+      return;
+    }
+
+    if (selectedItem && selectedItem.quantity <= 0) {
+      setErrorMsg('This surplus food item is currently sold out');
+      return;
+    }
+
+    if (selectedItem && qty > selectedItem.quantity) {
+      setErrorMsg(`Only ${selectedItem.quantity} items available in stock. Cannot reserve ${qty}.`);
+      return;
+    }
+
     setCheckoutStep('payment');
   };
 
   const handleReserveSubmit = async (e) => {
     e.preventDefault();
-    setReserveLoading(true);
     setErrorMsg('');
+
+    const trimmedCardName = cardName.trim();
+    if (!trimmedCardName || trimmedCardName.length < 2) {
+      setErrorMsg('Please enter cardholder name (at least 2 characters)');
+      return;
+    }
+
+    if (!isValidCardNumber(cardNumber)) {
+      setErrorMsg('Please enter a valid 16-digit card number');
+      return;
+    }
+
+    if (!isValidCardExpiry(cardExpiry)) {
+      setErrorMsg('Please enter a valid expiry date (MM/YY) that is not expired');
+      return;
+    }
+
+    if (!isValidCvv(cardCvv)) {
+      setErrorMsg('Please enter a valid 3-digit CVV / security code');
+      return;
+    }
+
+    setReserveLoading(true);
 
     try {
       // Extract last 4 digits of simulated card
@@ -85,7 +205,7 @@ const CustomerDashboard = () => {
 
       const { data } = await api.post('/customer/reservations', {
         foodItemId: selectedItem._id,
-        quantity: reserveQty,
+        quantity: parseInt(reserveQty, 10),
         cardLast4: last4
       });
       
@@ -165,7 +285,7 @@ const CustomerDashboard = () => {
 
       {/* Search and Filters Bar */}
       <section className="glass-panel" style={{ padding: '1.5rem', marginBottom: '2.5rem' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '1rem', flexWrap: 'wrap' }} className="filters-grid">
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '1rem', flexWrap: 'wrap', marginBottom: '1.25rem' }} className="filters-grid">
           
           {/* Search */}
           <div style={{ position: 'relative' }}>
@@ -209,6 +329,66 @@ const CustomerDashboard = () => {
           </div>
 
         </div>
+
+        {/* Dietary & Allergen Quick Filter Buttons */}
+        <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+          
+          {/* Dietary Type Radio Pills */}
+          <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', fontWeight: 600, marginRight: '0.2rem' }}>Diet:</span>
+            {[
+              { id: 'all', label: 'All' },
+              { id: 'veg', label: '🟢 Veg' },
+              { id: 'non-veg', label: '🔴 Non-Veg' },
+              { id: 'vegan', label: '🌱 Vegan' }
+            ].map((type) => (
+              <button
+                key={type.id}
+                type="button"
+                onClick={() => setDietaryType(type.id)}
+                className={`btn btn-sm ${dietaryType === type.id ? 'btn-primary' : 'btn-secondary'}`}
+                style={{ fontSize: '0.75rem', padding: '0.25rem 0.65rem' }}
+              >
+                {type.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Surprise Bags Filter Toggle & Allergen Tag Selector */}
+          <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              onClick={() => setIsSurpriseBagOnly(!isSurpriseBagOnly)}
+              className={`btn btn-sm ${isSurpriseBagOnly ? 'btn-primary' : 'btn-secondary'}`}
+              style={{ 
+                fontSize: '0.75rem', 
+                padding: '0.25rem 0.75rem',
+                background: isSurpriseBagOnly ? 'linear-gradient(135deg, #ec4899, #8b5cf6)' : 'rgba(236, 72, 153, 0.1)',
+                color: isSurpriseBagOnly ? '#fff' : '#f472b6',
+                border: '1px solid rgba(236, 72, 153, 0.3)',
+                fontWeight: 600
+              }}
+            >
+              🎁 Surprise Bags Only
+            </button>
+
+            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', fontWeight: 600, marginRight: '0.2rem' }}>Allergen:</span>
+              {['all', 'Gluten-Free', 'Dairy-Free', 'Nut-Free', 'Halal'].map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => setSelectedAllergen(tag)}
+                  className={`btn btn-sm ${selectedAllergen === tag ? 'btn-primary' : 'btn-secondary'}`}
+                  style={{ fontSize: '0.75rem', padding: '0.25rem 0.65rem' }}
+                >
+                  {tag === 'all' ? 'Any' : tag}
+                </button>
+              ))}
+            </div>
+          </div>
+
+        </div>
       </section>
 
       {/* Error state */}
@@ -232,25 +412,41 @@ const CustomerDashboard = () => {
       ) : (
         <div className="grid-cols-3">
           {listings.map((item) => {
-            const savings = item.originalPrice - item.discountedPrice;
-            const savingsPercent = Math.round((savings / item.originalPrice) * 100);
+            const origPrice = Math.max(0.01, item.originalPrice || 0);
+            const discPrice = Math.max(0, item.discountedPrice || 0);
+            const savings = Math.max(0, origPrice - discPrice);
+            const savingsPercent = Math.min(100, Math.max(0, Math.round((savings / origPrice) * 100)));
+            const inStockQty = Math.max(0, item.quantity || 0);
             
             return (
-              <div key={item._id} className="glass-card" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              <div 
+                key={item._id} 
+                className="glass-card" 
+                style={{ 
+                  display: 'flex', 
+                  flexDirection: 'column', 
+                  height: '100%',
+                  minWidth: 0,
+                  border: item.isSurpriseBag ? '1px solid rgba(236, 72, 153, 0.4)' : '1px solid var(--glass-border)',
+                  boxShadow: item.isSurpriseBag ? '0 4px 20px rgba(236, 72, 153, 0.12)' : 'none'
+                }}
+              >
                 {/* Image or Placeholder */}
                 {item.imagePath ? (
                   <img src={`http://localhost:5000${item.imagePath}`} alt={item.name} className="card-img" />
                 ) : (
-                  <div className="card-img-placeholder">
+                  <div className="card-img-placeholder" style={{ background: item.isSurpriseBag ? 'linear-gradient(135deg, rgba(236, 72, 153, 0.15), rgba(139, 92, 246, 0.15))' : '' }}>
                     <Utensils size={32} />
                   </div>
                 )}
 
                 {/* Content */}
-                <div style={{ flexGrow: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem' }}>
-                    <h3 style={{ fontSize: '1.2rem' }}>{item.name}</h3>
-                    <span className="badge badge-danger">{savingsPercent}% OFF</span>
+                <div style={{ flexGrow: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem', gap: '0.5rem' }}>
+                    <h3 style={{ fontSize: '1.2rem', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }} title={item.name}>
+                      {item.name}
+                    </h3>
+                    <span className="badge badge-danger" style={{ flexShrink: 0 }}>{savingsPercent}% OFF</span>
                   </div>
 
                   <p className="text-emerald" style={{ fontSize: '0.85rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.25rem', marginBottom: '0.75rem' }}>
@@ -267,24 +463,51 @@ const CustomerDashboard = () => {
                     <p style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }} className="text-secondary">
                       <MapPin size={12} /> {item.restaurant.address}
                     </p>
-                    <p style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }} className="text-secondary">
-                      <Clock size={12} /> Pickup: {item.pickupStartTime} - {item.pickupEndTime}
-                    </p>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.4rem' }}>
+                      <p style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem', margin: 0 }} className="text-secondary">
+                        <Clock size={12} /> Pickup: {item.pickupStartTime} - {item.pickupEndTime}
+                      </p>
+                      <ExpiryTimer expiryDate={item.expiryDate} pickupEndTime={item.pickupEndTime} />
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', marginTop: '0.4rem', alignItems: 'center' }}>
+                      <span className={`badge ${inStockQty > 0 ? 'badge-secondary' : 'badge-danger'}`} style={{ fontSize: '0.65rem' }}>
+                        📦 {inStockQty > 0 ? `${inStockQty} in stock` : 'Sold out'}
+                      </span>
+                      {item.isSurpriseBag && (
+                        <span className="badge" style={{ fontSize: '0.65rem', background: 'linear-gradient(135deg, #ec4899, #8b5cf6)', color: '#fff', fontWeight: 700 }}>
+                          🎁 MYSTERY BAG
+                        </span>
+                      )}
+                      <span className={`badge ${item.dietaryType === 'veg' ? 'badge-success' : item.dietaryType === 'vegan' ? 'badge-info' : 'badge-warning'}`} style={{ fontSize: '0.65rem' }}>
+                        {item.dietaryType === 'veg' ? '🟢 Veg' : item.dietaryType === 'vegan' ? '🌱 Vegan' : '🔴 Non-Veg'}
+                      </span>
+                      {item.allergens && item.allergens.map((tag) => (
+                        <span key={tag} className="badge badge-secondary" style={{ fontSize: '0.6rem', background: 'rgba(255,255,255,0.06)' }}>
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
                 {/* Footer / Pricing & Action */}
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem', marginTop: 'auto' }}>
-                  <div>
-                    <span style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>${item.discountedPrice.toFixed(2)}</span>
-                    <span style={{ textDecoration: 'line-through', fontSize: '0.85rem', color: 'var(--text-muted)', marginLeft: '0.5rem' }}>${item.originalPrice.toFixed(2)}</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem', marginTop: 'auto', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <span style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+                      ${discPrice.toFixed(2)}
+                    </span>
+                    <span style={{ textDecoration: 'line-through', fontSize: '0.85rem', color: 'var(--text-muted)', marginLeft: '0.5rem' }}>
+                      ${Math.max(0, item.estimatedValue || origPrice).toFixed(2)}
+                    </span>
                   </div>
 
                   <button 
                     onClick={() => handleOpenReserve(item)}
-                    className="btn btn-primary btn-sm"
+                    className={`btn btn-sm ${inStockQty > 0 ? 'btn-primary' : 'btn-secondary'}`}
+                    disabled={inStockQty <= 0}
+                    style={inStockQty <= 0 ? { opacity: 0.6, cursor: 'not-allowed' } : {}}
                   >
-                    Reserve ({item.quantity})
+                    {inStockQty > 0 ? `Reserve (${inStockQty})` : 'Sold Out'}
                   </button>
                 </div>
               </div>
@@ -304,38 +527,48 @@ const CustomerDashboard = () => {
               <form onSubmit={handleProceedToPayment}>
                 <h3 style={{ fontSize: '1.4rem', marginBottom: '1.25rem', fontFamily: 'var(--font-display)' }}>Reserve Surplus Food</h3>
                 
-                <div className="glass-panel" style={{ padding: '1rem', marginBottom: '1.5rem' }}>
-                  <h4 style={{ fontSize: '1.05rem' }}>{selectedItem.name}</h4>
+                <div className="glass-panel" style={{ padding: '1rem', marginBottom: '1.5rem', minWidth: 0 }}>
+                  <h4 style={{ fontSize: '1.05rem', wordBreak: 'break-word' }}>{selectedItem.name}</h4>
                   <p className="text-emerald" style={{ fontWeight: 600, fontSize: '0.9rem', margin: '0.25rem 0' }}>{selectedItem.restaurant.restaurantName}</p>
                   <p className="text-muted" style={{ fontSize: '0.8rem' }}>Pickup: {selectedItem.pickupStartTime} - {selectedItem.pickupEndTime}</p>
                   
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '0.75rem', fontSize: '0.9rem', fontWeight: 600 }}>
                     <span>Price per item:</span>
-                    <span className="text-emerald">${selectedItem.discountedPrice.toFixed(2)}</span>
+                    <span className="text-emerald">${Math.max(0, selectedItem.discountedPrice || 0).toFixed(2)}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '0.3rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                    <span>Available stock:</span>
+                    <span style={{ fontWeight: 600 }}>{Math.max(0, selectedItem.quantity)} items</span>
                   </div>
                 </div>
 
-                <div className="form-group">
-                  <label className="form-label">Select Quantity</label>
-                  <select 
-                    className="form-control" 
-                    value={reserveQty} 
-                    onChange={(e) => setReserveQty(Number(e.target.value))}
-                  >
-                    {[...Array(selectedItem.quantity).keys()].map((q) => (
-                      <option key={q + 1} value={q + 1}>{q + 1}</option>
-                    ))}
-                  </select>
-                </div>
+                {selectedItem.quantity <= 0 ? (
+                  <div className="badge badge-danger" style={{ width: '100%', padding: '0.75rem', textAlign: 'center', marginBottom: '1.5rem', textTransform: 'none' }}>
+                    Sorry, this surplus food item is currently sold out.
+                  </div>
+                ) : (
+                  <div className="form-group">
+                    <label className="form-label">Select Quantity</label>
+                    <select 
+                      className="form-control" 
+                      value={reserveQty} 
+                      onChange={(e) => setReserveQty(Math.max(1, Number(e.target.value)))}
+                    >
+                      {[...Array(Math.min(50, Math.max(1, selectedItem.quantity))).keys()].map((q) => (
+                        <option key={q + 1} value={q + 1}>{q + 1}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2rem', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2rem', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                   <div>
                     <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Subtotal:</p>
                     <p style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                      ${(selectedItem.discountedPrice * reserveQty).toFixed(2)}
+                      ${Math.max(0, (selectedItem.discountedPrice || 0) * Math.max(1, reserveQty)).toFixed(2)}
                     </p>
                   </div>
-                  <button type="submit" className="btn btn-primary btn-sm">
+                  <button type="submit" className="btn btn-primary btn-sm" disabled={selectedItem.quantity <= 0}>
                     Proceed to Payment
                   </button>
                 </div>
@@ -418,11 +651,11 @@ const CustomerDashboard = () => {
                   </div>
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '1.5rem', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '1.5rem', borderTop: '1px solid var(--glass-border)', paddingTop: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                   <div>
                     <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Total Cost:</p>
                     <p style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                      ${(selectedItem.discountedPrice * reserveQty).toFixed(2)}
+                      ${Math.max(0, (selectedItem.discountedPrice || 0) * Math.max(1, reserveQty)).toFixed(2)}
                     </p>
                   </div>
 

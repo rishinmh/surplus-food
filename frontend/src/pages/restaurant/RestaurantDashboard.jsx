@@ -1,12 +1,87 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
-import { Plus, BarChart3, Star, BadgeDollarSign, HeartHandshake, Utensils, Image, Trash2, Edit2, Check, X } from 'lucide-react';
+import { Plus, BarChart3, Star, BadgeDollarSign, HeartHandshake, Utensils, Image, Trash2, Edit2, Bell, Clock, ShoppingBag } from 'lucide-react';
+import { io } from 'socket.io-client';
+
+// Live Expiry & Pickup Countdown Timer Component
+const ExpiryTimer = ({ expiryDate, pickupEndTime }) => {
+  const [timeLeft, setTimeLeft] = useState('');
+  const [isUrgent, setIsUrgent] = useState(false);
+  const [isExpired, setIsExpired] = useState(false);
+
+  useEffect(() => {
+    const calculateTime = () => {
+      let target = expiryDate ? new Date(expiryDate).getTime() : null;
+      if (!target && pickupEndTime) {
+        const [hours, minutes] = pickupEndTime.split(':');
+        const d = new Date();
+        d.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0);
+        if (d.getTime() < Date.now()) d.setDate(d.getDate() + 1);
+        target = d.getTime();
+      }
+
+      if (!target) return;
+
+      const diff = target - Date.now();
+      if (diff <= 0) {
+        setIsExpired(true);
+        setTimeLeft('Expired');
+        return;
+      }
+
+      setIsExpired(false);
+      const hours = Math.floor(diff / (1000 * 60 * 60));
+      const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const secs = Math.floor((diff % (1000 * 60)) / 1000);
+
+      setIsUrgent(diff < 30 * 60 * 1000);
+
+      const pad = (n) => String(n).padStart(2, '0');
+      if (hours > 0) {
+        setTimeLeft(`${pad(hours)}h ${pad(mins)}m ${pad(secs)}s`);
+      } else {
+        setTimeLeft(`${pad(mins)}m ${pad(secs)}s`);
+      }
+    };
+
+    calculateTime();
+    const interval = setInterval(calculateTime, 1000);
+
+    return () => clearInterval(interval);
+  }, [expiryDate, pickupEndTime]);
+
+  if (isExpired) {
+    return (
+      <span className="badge badge-danger" style={{ fontSize: '0.65rem', display: 'inline-flex', alignItems: 'center', gap: '0.2rem' }}>
+        🔴 Expired
+      </span>
+    );
+  }
+
+  return (
+    <span 
+      className={`badge ${isUrgent ? 'badge-danger' : 'badge-secondary'}`} 
+      style={{ 
+        fontSize: '0.65rem', 
+        display: 'inline-flex', 
+        alignItems: 'center', 
+        gap: '0.25rem',
+        background: isUrgent ? 'linear-gradient(135deg, #ef4444, #f59e0b)' : 'rgba(255,255,255,0.08)',
+        color: '#fff',
+        fontWeight: isUrgent ? 700 : 600
+      }}
+    >
+      <Clock size={10} /> {isUrgent ? '🔥 Ending Soon:' : '⏳ Ends In:'} {timeLeft}
+    </span>
+  );
+};
 
 const RestaurantDashboard = () => {
   const [listings, setListings] = useState([]);
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
+  const [liveNotification, setLiveNotification] = useState(null);
 
   // Add/Edit Listing Modal states
   const [showModal, setShowModal] = useState(false);
@@ -21,7 +96,13 @@ const RestaurantDashboard = () => {
   const [quantity, setQuantity] = useState('');
   const [pickupStartTime, setPickupStartTime] = useState('18:00');
   const [pickupEndTime, setPickupEndTime] = useState('21:00');
+  const [dietaryType, setDietaryType] = useState('veg');
+  const [allergens, setAllergens] = useState([]);
+  const [isSurpriseBag, setIsSurpriseBag] = useState(false);
+  const [estimatedValue, setEstimatedValue] = useState('');
   const [imageFile, setImageFile] = useState(null);
+
+  const availableAllergens = ['Gluten-Free', 'Dairy-Free', 'Nut-Free', 'Halal'];
 
   const fetchData = async () => {
     setLoading(true);
@@ -42,7 +123,39 @@ const RestaurantDashboard = () => {
 
   useEffect(() => {
     fetchData();
+
+    // Initialize Socket.io connection for live notifications
+    const socket = io('http://localhost:5000');
+
+    socket.on('connect', () => {
+      console.log('⚡ Connected to Socket.io server');
+    });
+
+    socket.on('new_reservation', (data) => {
+      setLiveNotification(`🔔 LIVE RESERVATION: ${data.customerName} reserved ${data.quantity}x ${data.itemName} ($${data.totalPrice.toFixed(2)})! Token: ${data.token}`);
+      // Refresh inventory and revenue stats live without page reload
+      fetchData();
+    });
+
+    socket.on('listings_updated', () => {
+      fetchData();
+    });
+
+    return () => {
+      socket.disconnect();
+    };
   }, []);
+
+  // Join private room once analytics/profileId is available
+  useEffect(() => {
+    if (analytics && analytics.profileId) {
+      const socket = io('http://localhost:5000');
+      socket.emit('join_room', `restaurant_${analytics.profileId}`);
+      return () => {
+        socket.disconnect();
+      };
+    }
+  }, [analytics?.profileId]);
 
   const handleOpenAdd = () => {
     setEditingItem(null);
@@ -53,6 +166,10 @@ const RestaurantDashboard = () => {
     setQuantity('');
     setPickupStartTime('18:00');
     setPickupEndTime('21:00');
+    setDietaryType('veg');
+    setAllergens([]);
+    setIsSurpriseBag(false);
+    setEstimatedValue('');
     setImageFile(null);
     setErrorMsg('');
     setShowModal(true);
@@ -67,9 +184,33 @@ const RestaurantDashboard = () => {
     setQuantity(item.quantity || '');
     setPickupStartTime(item.pickupStartTime || '18:00');
     setPickupEndTime(item.pickupEndTime || '21:00');
+    setDietaryType(item.dietaryType || 'veg');
+    setAllergens(item.allergens || []);
+    setIsSurpriseBag(item.isSurpriseBag || false);
+    setEstimatedValue(item.estimatedValue || item.originalPrice || '');
     setImageFile(null);
     setErrorMsg('');
     setShowModal(true);
+  };
+
+  const handleSurpriseBagToggle = (e) => {
+    const checked = e.target.checked;
+    setIsSurpriseBag(checked);
+    if (checked) {
+      if (!name) setName('Daily Surplus Mystery Bag 🎁');
+      if (!description) setDescription('A surprise assortment of delicious daily surplus items valued at $15 for just $4.99!');
+      if (!originalPrice) setOriginalPrice('15.00');
+      if (!discountedPrice) setDiscountedPrice('4.99');
+      if (!estimatedValue) setEstimatedValue('15.00');
+    }
+  };
+
+  const handleAllergenToggle = (tag) => {
+    if (allergens.includes(tag)) {
+      setAllergens(allergens.filter((t) => t !== tag));
+    } else {
+      setAllergens([...allergens, tag]);
+    }
   };
 
   const handleFileChange = (e) => {
@@ -78,18 +219,58 @@ const RestaurantDashboard = () => {
 
   const handleModalSubmit = async (e) => {
     e.preventDefault();
-    setModalLoading(true);
     setErrorMsg('');
+
+    const trimmedName = name.trim();
+    if (!trimmedName || trimmedName.length < 2) {
+      setErrorMsg('Please enter a valid title (at least 2 characters)');
+      return;
+    }
+
+    const origPriceNum = parseFloat(originalPrice);
+    if (isNaN(origPriceNum) || origPriceNum <= 0) {
+      setErrorMsg('Original price must be a valid positive amount greater than $0');
+      return;
+    }
+
+    const discPriceNum = parseFloat(discountedPrice);
+    if (isNaN(discPriceNum) || discPriceNum < 0) {
+      setErrorMsg('Offer price cannot be negative');
+      return;
+    }
+
+    if (discPriceNum > origPriceNum) {
+      setErrorMsg(`Discounted price ($${discPriceNum.toFixed(2)}) cannot be greater than original price ($${origPriceNum.toFixed(2)})`);
+      return;
+    }
+
+    const qtyNum = parseInt(quantity, 10);
+    const minAllowedQty = editingItem ? 0 : 1;
+    if (isNaN(qtyNum) || qtyNum < minAllowedQty) {
+      setErrorMsg(editingItem ? 'Stock quantity cannot be negative (must be 0 or more)' : 'Stock quantity must be at least 1 item');
+      return;
+    }
+
+    if (!pickupStartTime || !pickupEndTime) {
+      setErrorMsg('Both pickup start time and end time are required');
+      return;
+    }
+
+    setModalLoading(true);
 
     // Form data for file upload support
     const formData = new FormData();
-    formData.append('name', name);
-    formData.append('description', description);
-    formData.append('originalPrice', originalPrice);
-    formData.append('discountedPrice', discountedPrice);
-    formData.append('quantity', quantity);
+    formData.append('name', trimmedName);
+    formData.append('description', description.trim());
+    formData.append('originalPrice', origPriceNum);
+    formData.append('discountedPrice', discPriceNum);
+    formData.append('quantity', qtyNum);
     formData.append('pickupStartTime', pickupStartTime);
     formData.append('pickupEndTime', pickupEndTime);
+    formData.append('dietaryType', dietaryType);
+    formData.append('allergens', JSON.stringify(allergens));
+    formData.append('isSurpriseBag', isSurpriseBag);
+    formData.append('estimatedValue', estimatedValue ? parseFloat(estimatedValue) : origPriceNum);
     if (imageFile) {
       formData.append('image', imageFile);
     }
@@ -146,6 +327,36 @@ const RestaurantDashboard = () => {
         )}
       </header>
 
+      {/* Live Socket.io Notification Banner */}
+      {liveNotification && (
+        <div 
+          className="animate-fade-in" 
+          style={{ 
+            background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(59, 130, 246, 0.15))', 
+            border: '1px solid var(--color-primary)', 
+            borderRadius: '12px', 
+            padding: '1rem 1.25rem', 
+            marginBottom: '2rem', 
+            display: 'flex', 
+            alignItems: 'center', 
+            justify: 'space-between',
+            boxShadow: '0 4px 16px rgba(16, 185, 129, 0.2)'
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+            <Bell size={20} className="text-emerald" style={{ animation: 'bounce 1s infinite' }} />
+            <span>{liveNotification}</span>
+          </div>
+          <button 
+            className="btn btn-secondary btn-sm" 
+            style={{ fontSize: '0.75rem', padding: '0.2rem 0.5rem' }}
+            onClick={() => setLiveNotification(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {errorMsg && !showModal && (
         <div className="badge badge-danger" style={{ width: '100%', padding: '1rem', marginBottom: '2rem', display: 'block', textTransform: 'none', textAlign: 'center' }}>
           {errorMsg}
@@ -154,45 +365,57 @@ const RestaurantDashboard = () => {
 
       {/* Analytics Widgets */}
       {analytics && (
-        <section style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1.5rem', marginBottom: '3rem' }} className="analytics-grid">
+        <section className="analytics-grid">
           
-          <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-            <div style={{ padding: '0.75rem', borderRadius: 'var(--border-radius-sm)', background: 'var(--color-primary-glow)' }}>
+          <div className="glass-panel analytics-widget">
+            <div className="analytics-widget-icon" style={{ background: 'var(--color-primary-glow)' }}>
               <BadgeDollarSign className="text-emerald" size={24} />
             </div>
-            <div>
-              <p className="text-muted" style={{ fontSize: '0.8rem', fontWeight: 600 }}>Total Revenue</p>
-              <h3 style={{ fontSize: '1.5rem' }}>${analytics.totalRevenue.toFixed(2)}</h3>
+            <div className="analytics-widget-content">
+              <p className="analytics-widget-label">Total Revenue</p>
+              <h3 className="analytics-widget-value">${Math.max(0, analytics.totalRevenue || 0).toFixed(2)}</h3>
             </div>
           </div>
 
-          <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-            <div style={{ padding: '0.75rem', borderRadius: 'var(--border-radius-sm)', background: 'rgba(99, 102, 241, 0.1)' }}>
+          <div className="glass-panel analytics-widget">
+            <div className="analytics-widget-icon" style={{ background: 'rgba(16, 185, 129, 0.12)' }}>
+              <ShoppingBag className="text-emerald" size={24} />
+            </div>
+            <div className="analytics-widget-content">
+              <p className="analytics-widget-label">Available Stock</p>
+              <h3 className="analytics-widget-value">
+                {Math.max(0, analytics.totalStockAvailable ?? listings.filter(i => i.status === 'available').reduce((sum, item) => sum + Math.max(0, item.quantity), 0))} bags
+              </h3>
+            </div>
+          </div>
+
+          <div className="glass-panel analytics-widget">
+            <div className="analytics-widget-icon" style={{ background: 'rgba(99, 102, 241, 0.1)' }}>
               <HeartHandshake className="text-indigo" size={24} />
             </div>
-            <div>
-              <p className="text-muted" style={{ fontSize: '0.8rem', fontWeight: 600 }}>Meals Rescued</p>
-              <h3 style={{ fontSize: '1.5rem' }}>{analytics.mealsSaved}</h3>
+            <div className="analytics-widget-content">
+              <p className="analytics-widget-label">Meals Rescued</p>
+              <h3 className="analytics-widget-value">{Math.max(0, analytics.mealsSaved || 0)}</h3>
             </div>
           </div>
 
-          <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-            <div style={{ padding: '0.75rem', borderRadius: 'var(--border-radius-sm)', background: 'rgba(245, 158, 11, 0.1)' }}>
+          <div className="glass-panel analytics-widget">
+            <div className="analytics-widget-icon" style={{ background: 'rgba(245, 158, 11, 0.1)' }}>
               <Star className="text-amber" size={24} fill="currentColor" />
             </div>
-            <div>
-              <p className="text-muted" style={{ fontSize: '0.8rem', fontWeight: 600 }}>Rating Average</p>
-              <h3 style={{ fontSize: '1.5rem' }}>{analytics.rating} / 5</h3>
+            <div className="analytics-widget-content">
+              <p className="analytics-widget-label">Rating Average</p>
+              <h3 className="analytics-widget-value">{analytics.rating ? Number(analytics.rating).toFixed(1) : '5.0'} / 5</h3>
             </div>
           </div>
 
-          <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-            <div style={{ padding: '0.75rem', borderRadius: 'var(--border-radius-sm)', background: 'rgba(255, 255, 255, 0.05)' }}>
+          <div className="glass-panel analytics-widget">
+            <div className="analytics-widget-icon" style={{ background: 'rgba(255, 255, 255, 0.05)' }}>
               <BarChart3 className="text-secondary" size={24} />
             </div>
-            <div>
-              <p className="text-muted" style={{ fontSize: '0.8rem', fontWeight: 600 }}>Bookings Queue</p>
-              <h3 style={{ fontSize: '1.5rem' }}>{analytics.activeReservationsCount} active</h3>
+            <div className="analytics-widget-content">
+              <p className="analytics-widget-label">Bookings Queue</p>
+              <h3 className="analytics-widget-value">{Math.max(0, analytics.activeReservationsCount || 0)} active</h3>
             </div>
           </div>
 
@@ -239,10 +462,12 @@ const RestaurantDashboard = () => {
 
                 {/* Details */}
                 <div style={{ flexGrow: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                    <h3 style={{ fontSize: '1.15rem' }}>{item.name}</h3>
-                    <span className={`badge ${item.status === 'available' ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: '0.65rem' }}>
-                      {item.status}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', gap: '0.5rem' }}>
+                    <h3 style={{ fontSize: '1.15rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }} title={item.name}>
+                      {item.name}
+                    </h3>
+                    <span className={`badge ${item.status === 'available' && item.quantity > 0 ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: '0.65rem', flexShrink: 0 }}>
+                      {item.status === 'available' && item.quantity > 0 ? `${item.quantity} in stock` : 'Sold out'}
                     </span>
                   </div>
 
@@ -250,11 +475,34 @@ const RestaurantDashboard = () => {
                     {item.description || 'No description provided.'}
                   </p>
 
-                  <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1.25rem' }}>
-                    <p><strong>Original Price:</strong> ${item.originalPrice.toFixed(2)}</p>
-                    <p><strong>Offer Price:</strong> <span className="text-emerald" style={{ fontWeight: 600 }}>${item.discountedPrice.toFixed(2)}</span></p>
-                    <p><strong>In Stock:</strong> {item.quantity} bags</p>
-                    <p><strong>Pickup window:</strong> {item.pickupStartTime} - {item.pickupEndTime}</p>
+                  <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1.25rem' }}>
+                    <p><strong>Original Price:</strong> ${Math.max(0, item.originalPrice || 0).toFixed(2)}</p>
+                    <p><strong>Offer Price:</strong> <span className="text-emerald" style={{ fontWeight: 600 }}>${Math.max(0, item.discountedPrice || 0).toFixed(2)}</span></p>
+                    <p>
+                      <strong>In Stock:</strong>{' '}
+                      <span className={item.quantity > 0 ? 'text-emerald' : 'text-rose'} style={{ fontWeight: 600 }}>
+                        {Math.max(0, item.quantity)} {item.quantity === 1 ? 'bag' : 'bags'} {item.quantity <= 0 ? '(Sold Out)' : ''}
+                      </span>
+                    </p>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.4rem', marginTop: '0.2rem' }}>
+                      <p style={{ margin: 0, fontSize: '0.78rem' }}><strong>Pickup:</strong> {item.pickupStartTime} - {item.pickupEndTime}</p>
+                      <ExpiryTimer expiryDate={item.expiryDate} pickupEndTime={item.pickupEndTime} />
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', marginTop: '0.4rem' }}>
+                      {item.isSurpriseBag && (
+                        <span className="badge" style={{ fontSize: '0.65rem', background: 'linear-gradient(135deg, #ec4899, #8b5cf6)', color: '#fff', fontWeight: 700 }}>
+                          🎁 MYSTERY BAG
+                        </span>
+                      )}
+                      <span className={`badge ${item.dietaryType === 'veg' ? 'badge-success' : item.dietaryType === 'vegan' ? 'badge-info' : 'badge-warning'}`} style={{ fontSize: '0.65rem' }}>
+                        {item.dietaryType === 'veg' ? '🟢 Veg' : item.dietaryType === 'vegan' ? '🌱 Vegan' : '🔴 Non-Veg'}
+                      </span>
+                      {item.allergens && item.allergens.map((tag) => (
+                        <span key={tag} className="badge badge-secondary" style={{ fontSize: '0.6rem', background: 'rgba(255,255,255,0.06)' }}>
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
@@ -285,7 +533,7 @@ const RestaurantDashboard = () => {
       {/* Creation/Editing Modal Overlay */}
       {showModal && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ maxWidth: '550px' }}>
+          <div className="modal-content" style={{ maxWidth: '560px', width: '100%', maxHeight: '90vh', overflowY: 'auto', overflowX: 'hidden', boxSizing: 'border-box' }}>
             <button className="modal-close" onClick={() => setShowModal(false)}>×</button>
             
             <h3 style={{ fontSize: '1.5rem', marginBottom: '1.5rem', fontFamily: 'var(--font-display)' }}>
@@ -299,12 +547,37 @@ const RestaurantDashboard = () => {
             )}
 
             <form onSubmit={handleModalSubmit}>
+              {/* Surprise Bag / Mystery Box Toggle */}
+              <div 
+                style={{ 
+                  background: 'rgba(236, 72, 153, 0.08)', 
+                  border: '1px border-radius var(--border-radius-sm)', 
+                  borderLeft: '4px solid #ec4899', 
+                  padding: '0.85rem 1rem', 
+                  marginBottom: '1.25rem',
+                  borderRadius: '8px'
+                }}
+              >
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.9rem', color: '#f472b6' }}>
+                  <input 
+                    type="checkbox" 
+                    checked={isSurpriseBag} 
+                    onChange={handleSurpriseBagToggle}
+                    style={{ width: '16px', height: '16px', accentColor: '#ec4899' }}
+                  />
+                  🎁 Mark as Surprise Bag / Mystery Box (Too Good To Go Style)
+                </label>
+                <p className="text-secondary" style={{ fontSize: '0.78rem', margin: '0.25rem 0 0 1.6rem' }}>
+                  Select if exact contents are unknown ahead of time. Customers get a surprise mix worth an estimated retail value!
+                </p>
+              </div>
+
               <div className="form-group">
-                <label className="form-label">Food Title / Name</label>
+                <label className="form-label">{isSurpriseBag ? 'Surprise Bag Title' : 'Food Title / Name'}</label>
                 <input 
                   type="text" 
                   required 
-                  placeholder="e.g. Sourdough Loaf Mix, Croissant Box" 
+                  placeholder={isSurpriseBag ? "e.g. Evening Bakery Surprise Bag 🎁" : "e.g. Sourdough Loaf Mix, Croissant Box"} 
                   className="form-control"
                   value={name} 
                   onChange={(e) => setName(e.target.value)} 
@@ -323,61 +596,152 @@ const RestaurantDashboard = () => {
                 />
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }} className="form-price-qty-row">
-                <div className="form-group">
+              {/* Dietary Category */}
+              <div className="form-group">
+                <label className="form-label">Dietary Preference</label>
+                <div style={{ display: 'flex', gap: '1rem' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input type="radio" name="dietaryType" value="veg" checked={dietaryType === 'veg'} onChange={(e) => setDietaryType(e.target.value)} />
+                    🟢 Vegetarian
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input type="radio" name="dietaryType" value="non-veg" checked={dietaryType === 'non-veg'} onChange={(e) => setDietaryType(e.target.value)} />
+                    🔴 Non-Veg
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input type="radio" name="dietaryType" value="vegan" checked={dietaryType === 'vegan'} onChange={(e) => setDietaryType(e.target.value)} />
+                    🌱 Vegan
+                  </label>
+                </div>
+              </div>
+
+              {/* Allergen & Dietary Tags */}
+              <div className="form-group">
+                <label className="form-label">Allergen & Dietary Tags</label>
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  {availableAllergens.map((tag) => {
+                    const isSelected = allergens.includes(tag);
+                    return (
+                      <button
+                        type="button"
+                        key={tag}
+                        onClick={() => handleAllergenToggle(tag)}
+                        className={`btn btn-sm ${isSelected ? 'btn-primary' : 'btn-secondary'}`}
+                        style={{ fontSize: '0.75rem', padding: '0.25rem 0.6rem' }}
+                      >
+                        {isSelected ? '✓ ' : '+ '} {tag}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div 
+                className="form-price-qty-row" 
+                style={{ 
+                  display: 'grid', 
+                  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', 
+                  gap: '0.75rem', 
+                  width: '100%',
+                  boxSizing: 'border-box' 
+                }}
+              >
+                <div className="form-group" style={{ minWidth: 0, width: '100%' }}>
                   <label className="form-label">Original ($)</label>
                   <input 
                     type="number" 
                     required 
+                    min="0.01"
                     step="0.01" 
                     placeholder="12.50" 
                     className="form-control"
+                    style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                     value={originalPrice} 
-                    onChange={(e) => setOriginalPrice(e.target.value)} 
+                    onKeyDown={(e) => { if (e.key === '-' || e.key === 'Subtract' || e.key === 'e' || e.key === 'E') e.preventDefault(); }}
+                    onPaste={(e) => {
+                      const text = e.clipboardData.getData('text');
+                      if (text.includes('-')) {
+                        e.preventDefault();
+                        setOriginalPrice(text.replace(/-/g, ''));
+                      }
+                    }}
+                    onChange={(e) => {
+                      const v = e.target.value.replace(/-/g, '');
+                      setOriginalPrice(v);
+                    }} 
                   />
                 </div>
-                <div className="form-group">
+                <div className="form-group" style={{ minWidth: 0, width: '100%' }}>
                   <label className="form-label">Discount ($)</label>
                   <input 
                     type="number" 
                     required 
+                    min="0"
                     step="0.01" 
                     placeholder="4.00" 
                     className="form-control"
+                    style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                     value={discountedPrice} 
-                    onChange={(e) => setDiscountedPrice(e.target.value)} 
+                    onKeyDown={(e) => { if (e.key === '-' || e.key === 'Subtract' || e.key === 'e' || e.key === 'E') e.preventDefault(); }}
+                    onPaste={(e) => {
+                      const text = e.clipboardData.getData('text');
+                      if (text.includes('-')) {
+                        e.preventDefault();
+                        setDiscountedPrice(text.replace(/-/g, ''));
+                      }
+                    }}
+                    onChange={(e) => {
+                      const v = e.target.value.replace(/-/g, '');
+                      setDiscountedPrice(v);
+                    }} 
                   />
                 </div>
-                <div className="form-group">
+                <div className="form-group" style={{ minWidth: 0, width: '100%' }}>
                   <label className="form-label">Stock Qty</label>
                   <input 
                     type="number" 
                     required 
+                    min={editingItem ? '0' : '1'}
+                    step="1"
                     placeholder="5" 
                     className="form-control"
+                    style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                     value={quantity} 
-                    onChange={(e) => setQuantity(e.target.value)} 
+                    onKeyDown={(e) => { if (e.key === '-' || e.key === 'Subtract' || e.key === '.' || e.key === 'e' || e.key === 'E') e.preventDefault(); }}
+                    onPaste={(e) => {
+                      const text = e.clipboardData.getData('text');
+                      if (text.includes('-') || text.includes('.')) {
+                        e.preventDefault();
+                        setQuantity(text.replace(/[^0-9]/g, ''));
+                      }
+                    }}
+                    onChange={(e) => {
+                      const v = e.target.value.replace(/[^0-9]/g, '');
+                      setQuantity(v);
+                    }} 
                   />
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-                <div className="form-group">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.75rem', width: '100%', boxSizing: 'border-box' }}>
+                <div className="form-group" style={{ minWidth: 0, width: '100%' }}>
                   <label className="form-label">Pickup Start Time</label>
                   <input 
                     type="time" 
                     required 
                     className="form-control"
+                    style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                     value={pickupStartTime} 
                     onChange={(e) => setPickupStartTime(e.target.value)} 
                   />
                 </div>
-                <div className="form-group">
+                <div className="form-group" style={{ minWidth: 0, width: '100%' }}>
                   <label className="form-label">Pickup End Time</label>
                   <input 
                     type="time" 
                     required 
                     className="form-control"
+                    style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                     value={pickupEndTime} 
                     onChange={(e) => setPickupEndTime(e.target.value)} 
                   />
@@ -412,18 +776,10 @@ const RestaurantDashboard = () => {
       )}
 
       <style>{`
-        @media (max-width: 768px) {
-          .analytics-grid {
-            grid-template-columns: 1fr 1fr !important;
-          }
+        @media (max-width: 520px) {
           .form-price-qty-row {
             grid-template-columns: 1fr !important;
-            gap: 0 !important;
-          }
-        }
-        @media (max-width: 480px) {
-          .analytics-grid {
-            grid-template-columns: 1fr !important;
+            gap: 0.75rem !important;
           }
         }
       `}</style>
